@@ -1,0 +1,87 @@
+# xprof-capture-jobset-gcs.yaml
+#
+# Job-native variant: the capture writes straight to a GCS bucket (mounted with
+# the gcsfuse CSI driver), so the Job runs to Completion and the profile
+# persists after the node scales down — no sleep, no kubectl cp. This is the
+# cleaner pattern for a JobSet and matches Google's tpu7x + gcsfuse example.
+#
+# One-time cluster setup (Workload Identity + gcsfuse driver):
+#   # if your cluster wasn't created with these, add them:
+#   gcloud container clusters update xprof-demo --location=us-central1 \
+#     --workload-pool=PROJECT_ID.svc.id.goog --update-addons=GcsFuseCsiDriver
+#
+#   gcloud storage buckets create gs://YOUR_BUCKET --location=us-central1
+#
+#   # KSA the pod runs as, bound directly to GCS write via Workload Identity:
+#   kubectl create serviceaccount xprof-ksa
+#   PROJECT_NUMBER=$(gcloud projects describe PROJECT_ID --format='value(projectNumber)')
+#   gcloud storage buckets add-iam-policy-binding gs://YOUR_BUCKET \
+#     --role=roles/storage.objectAdmin \
+#     --member="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/PROJECT_ID.svc.id.goog/subject/ns/default/sa/xprof-ksa"
+#
+#   kubectl create configmap capture-script --from-file=capture_profile.py
+#
+# Run / view:
+#   kubectl apply -f xprof-capture-jobset-gcs.yaml
+#   kubectl get pods -l jobset.sigs.k8s.io/jobset-name=xprof-capture -w   # Pending (DWS) -> Running -> Completed
+#   # view from GCS with the xprofiler tool, or pull locally:
+#   gcloud storage cp -r gs://YOUR_BUCKET/tb ./tb && xprof --logdir ./tb --port 6006
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: xprof-capture
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"        # opt in to the gcsfuse sidecar injection
+          spec:
+            restartPolicy: Never
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            serviceAccountName: xprof-ksa        # bound to GCS write via Workload Identity
+            nodeSelector:
+              cloud.google.com/gke-flex-start: "true"
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            containers:
+            - name: capture
+              image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+              securityContext:
+                privileged: false
+              command:
+              - bash
+              - -c
+              - |
+                set -ex
+                python /app/capture_profile.py --logdir /data/tb --steps 8
+                # Job completes here. Trace persists in gs://YOUR_BUCKET/tb.
+              volumeMounts:
+              - { name: script, mountPath: /app }
+              - { name: gcs,    mountPath: /data }
+              resources:
+                requests: { google.com/tpu: "4" }
+                limits:   { google.com/tpu: "4" }
+            volumes:
+            - name: script
+              configMap: { name: capture-script }
+            - name: gcs
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: YOUR_BUCKET
+                  mountOptions: "implicit-dirs"
+                  hostNetworkPodKSA: "true"       # required for hostNetwork TPU pods

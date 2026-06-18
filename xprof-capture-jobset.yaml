@@ -1,0 +1,72 @@
+# xprof-capture-jobset.yaml
+#
+# JobSet replacement for the single-host Ironwood (TPU7x) capture Pod.
+# Zero extra infrastructure: the container captures the profile to /tmp, then
+# sleeps so you can pull the trace out with `kubectl cp`. The JobSet stays
+# Running until you copy the trace and delete it (a Job won't reach Completed
+# while the container sleeps — that's intentional for this prep step).
+#
+# Prereqs:
+#   * JobSet controller installed in the cluster (v0.8.1 or newer):
+#       VERSION=v0.8.1
+#       kubectl apply --server-side \
+#         -f https://github.com/kubernetes-sigs/jobset/releases/download/$VERSION/manifests.yaml
+#   * The capture script shipped as a ConfigMap:
+#       kubectl create configmap capture-script --from-file=capture_profile.py
+#
+# Apply / watch / pull:
+#   kubectl apply -f xprof-capture-jobset.yaml
+#   kubectl get pods -l jobset.sigs.k8s.io/jobset-name=xprof-capture -w   # Pending (DWS) -> Running
+#   POD=$(kubectl get pods -l jobset.sigs.k8s.io/jobset-name=xprof-capture -o jsonpath='{.items[0].metadata.name}')
+#   kubectl logs -f "$POD"                 # ends with "trace written to: /tmp/tb"
+#   kubectl cp "$POD":/tmp/tb ./tb
+#   kubectl delete jobset xprof-capture    # releases the TPU node (autoscales to 0)
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: xprof-capture
+  annotations:
+    # 1 job : 1 node pool (slice). Correct for single-host and scale-ready for multislice.
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+  - name: slice
+    replicas: 1                  # one TPU slice. Bump to N for an N-slice multislice capture.
+    template:
+      spec:
+        parallelism: 1           # VMs per slice. 2x2x1 = 4 chips = 1 tpu7x VM = 1 node.
+        completions: 1
+        backoffLimit: 0
+        template:
+          spec:
+            restartPolicy: Never
+            hostNetwork: true                    # standard for TPU workloads; required once multi-host
+            dnsPolicy: ClusterFirstWithHostNet
+            nodeSelector:
+              cloud.google.com/gke-flex-start: "true"
+              cloud.google.com/gke-tpu-accelerator: tpu7x      # verify against the live node (see runbook §0)
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            containers:
+            - name: capture
+              image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+              securityContext:
+                privileged: false
+              command:
+              - bash
+              - -c
+              - |
+                set -ex
+                python /app/capture_profile.py --logdir /tmp/tb --steps 8
+                echo "capture done — sleeping so the trace can be copied out with kubectl cp"
+                sleep 3600
+              volumeMounts:
+              - { name: script, mountPath: /app }
+              resources:
+                requests: { google.com/tpu: "4" }
+                limits:   { google.com/tpu: "4" }
+            volumes:
+            - name: script
+              configMap: { name: capture-script }
